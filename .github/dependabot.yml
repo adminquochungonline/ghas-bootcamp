@@ -5,7 +5,7 @@ updates:
     schedule:
       interval: "daily"
     labels:
-      - "triage-required"
+      - "non-existent-label"
     assignees:
       - "adminquochungonline"
     commit-message:
