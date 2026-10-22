@@ -1,6 +1,6 @@
 # Build context: thư mục gốc repo
 #   docker build -f deploy/azure/authn-service/Dockerfile -t authn-service .
-FROM python:3.9-slim
+FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
