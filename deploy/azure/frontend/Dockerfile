@@ -24,7 +24,7 @@ RUN set -eu; \
     patch src/components/Login.vue 'client_id=aad2f5434c1efdb25ce6' 'client_id=__GITHUB_CLIENT_ID__'; \
     node .aca-build.js
 
-FROM nginxinc/nginx-unprivileged:1.27-alpine
+FROM nginxinc/nginx-unprivileged:1.31-alpine
 ENV AUTHN_UPSTREAM=http://authn-service \
     GALLERY_UPSTREAM=http://gallery-service \
     NGINX_ENVSUBST_FILTER=UPSTREAM
