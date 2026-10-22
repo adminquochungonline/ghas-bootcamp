@@ -1,0 +1,12 @@
+# Build context cho các image trong deploy/azure (context = thư mục gốc repo).
+# Không đưa secret, artefact build và dữ liệu local vào image.
+.git
+.github
+.devcontainer
+exercises
+**/.env
+**/*.db
+**/node_modules
+frontend/dist
+storage-service/target
+deploy/azure/deploy.env

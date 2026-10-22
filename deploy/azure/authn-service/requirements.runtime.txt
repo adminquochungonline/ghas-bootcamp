@@ -1,0 +1,19 @@
+# Chỉ các gói authn-service thực sự import (cùng phiên bản với authn-service/requirements.txt).
+# File gốc chứa nhiều gói cố ý cũ/không dùng (PyGObject, pycrypto, cryptography 2.6.1...) cho lab
+# Dependabot và không build được trên Python hiện đại, nên giữ nguyên file gốc và dùng file này cho image.
+Flask==1.1.2
+Flask-Cors==3.0.8
+Werkzeug==1.0.1
+Jinja2==2.11.2
+MarkupSafe==1.1.1
+itsdangerous==1.1.0
+click==7.1.2
+requests==2.24.0
+certifi==2020.6.20
+chardet==3.0.4
+idna==2.10
+urllib3==1.25.11
+six==1.12.0
+PyJWT==1.7.1
+python-dotenv==0.15.0
+gunicorn==20.1.0

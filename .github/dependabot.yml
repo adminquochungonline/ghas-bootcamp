@@ -10,3 +10,18 @@ updates:
       - "adminquochungonline"
     commit-message:
       prefix: "pip"
+
+  # Base image trong các Dockerfile (FROM ...)
+  - package-ecosystem: "docker"
+    directories:
+      - "/.devcontainer"
+      - "/deploy/azure/authn-service"
+      - "/deploy/azure/frontend"
+      - "/deploy/azure/gallery-service"
+      - "/deploy/azure/storage-service"
+    schedule:
+      interval: "weekly"
+    assignees:
+      - "adminquochungonline"
+    commit-message:
+      prefix: "docker"

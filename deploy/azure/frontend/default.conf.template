@@ -1,0 +1,33 @@
+# Được envsubst bởi entrypoint của image nginx (chỉ thay các biến *UPSTREAM*).
+server {
+    listen       8080;
+    server_name  _;
+    root         /usr/share/nginx/html;
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok";
+    }
+
+    # Gọi nội bộ trong Container Apps environment (http://<tên-app>).
+    # proxy_pass có dấu "/" ở cuối => bỏ prefix /api/authn khi chuyển tiếp.
+    location /api/authn/ {
+        proxy_pass         ${AUTHN_UPSTREAM}/;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_read_timeout 30s;
+    }
+
+    location /api/gallery/ {
+        proxy_pass         ${GALLERY_UPSTREAM}/;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_read_timeout 30s;
+    }
+
+    # Vue router chạy history mode
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
