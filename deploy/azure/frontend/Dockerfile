@@ -9,7 +9,7 @@
 # Build sẽ fail nếu không tìm thấy chuỗi cần thay (để phát hiện khi source thay đổi).
 # Build qua deploy/azure/frontend/build.js (bỏ eslint + thoát tường minh), xem chú thích trong file.
 
-FROM node:16-bullseye-slim AS build
+FROM node:26-bullseye-slim AS build
 WORKDIR /src
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
