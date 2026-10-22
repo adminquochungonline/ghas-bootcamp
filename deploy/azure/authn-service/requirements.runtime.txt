@@ -3,7 +3,7 @@
 # Dependabot và không build được trên Python hiện đại, nên giữ nguyên file gốc và dùng file này cho image.
 Flask==1.1.2
 Flask-Cors==3.0.8
-Werkzeug==1.0.1
+Werkzeug==3.1.9
 Jinja2==2.11.2
 MarkupSafe==1.1.1
 itsdangerous==1.1.0
