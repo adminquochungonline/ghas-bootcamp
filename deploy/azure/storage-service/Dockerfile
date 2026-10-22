@@ -1,7 +1,7 @@
 # (Tuỳ chọn) storage-service - frontend hiện không gọi service này. Cần AWS S3 thật để hoạt động.
 # Build context: thư mục gốc repo
 #   docker build -f deploy/azure/storage-service/Dockerfile -t storage-service .
-FROM maven:3.8.1-openjdk-15 AS build
+FROM maven:3.8-openjdk-18 AS build
 WORKDIR /src
 COPY storage-service/pom.xml ./
 RUN mvn -B -q dependency:go-offline
