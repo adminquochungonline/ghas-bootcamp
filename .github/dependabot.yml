@@ -25,3 +25,13 @@ updates:
       - "adminquochungonline"
     commit-message:
       prefix: "docker"
+
+  # Các action trong .github/workflows (đang pin theo commit SHA)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    assignees:
+      - "adminquochungonline"
+    commit-message:
+      prefix: "actions"

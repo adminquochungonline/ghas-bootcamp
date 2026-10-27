@@ -1,0 +1,404 @@
+# Pipeline DevSecOps cho mọi pull request vào main.
+#
+#   1. CVE: Dependency Review     - dependency mới/đổi trong PR có lỗ hổng HIGH/CRITICAL (GitHub Advisory DB)
+#   2. CVE: Trivy manifest repo   - pip, npm, maven, go trong toàn repo, so với nhánh base
+#   3. Build: authn-service       - phiên bản trong authn-service/requirements.txt cài được và app import được
+#   4. Build + CVE từng image     - build 4 image triển khai (deploy/azure/*), quét OS + thư viện bằng Trivy,
+#                                   so với image build từ nhánh base
+#   5. PR Gate                    - tổng hợp kết quả vào job summary; đặt check này là required để chặn merge
+#
+# Repo cố ý chứa nhiều dependency có lỗ hổng (lab GHAS), nên gate CVE chặn lỗ hổng HIGH/CRITICAL *mới do PR
+# đưa vào*; CVE đã có sẵn ở base vẫn được liệt kê đầy đủ trong báo cáo và artifact.
+#
+# Mọi action và image công cụ đều được pin theo commit SHA / digest (xem sự cố trivy-action tháng 3/2026,
+# CVE-2026-33634). Dependabot (ecosystem github-actions) có thể cập nhật các pin này.
+name: DevSecOps PR
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devsecops-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+  GATE_SEVERITIES: HIGH,CRITICAL
+  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+
+jobs:
+  # ------------------------------------------------------------------------------------------------
+  dependency-review:
+    name: "CVE: Dependency Review"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Dependency Review
+        id: review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          show-patched-versions: true
+          # Token của PR do Dependabot/fork tạo là read-only nên không comment được; kết quả nằm ở job summary.
+          comment-summary-in-pr: never
+
+      - name: Báo cáo
+        if: always()
+        env:
+          OUTCOME: ${{ steps.review.outcome }}
+          VULNERABLE_CHANGES: ${{ steps.review.outputs.vulnerable-changes }}
+        run: |
+          mkdir -p report
+          python3 - <<'EOF' > report/10-dependency-review.md
+          import json, os
+          outcome = os.environ["OUTCOME"]
+          raw = os.environ.get("VULNERABLE_CHANGES") or "[]"
+          try:
+              changes = json.loads(raw)
+          except ValueError:
+              changes = []
+          icon = {"success": "✅", "failure": "❌"}.get(outcome, "⚠️")
+          print("### 🔎 Dependency Review (GitHub Advisory Database)")
+          print(f"- {icon} Kết quả: `{outcome}` (chặn khi dependency PR thêm/đổi có lỗ hổng HIGH/CRITICAL)")
+          rows = []
+          for c in changes:
+              for v in c.get("vulnerabilities") or []:
+                  rows.append(f"| {v.get('severity','')} | [{v.get('advisory_ghsa_id','')}]({v.get('advisory_url','')}) "
+                              f"| {c.get('name','')}@{c.get('version','')} | {c.get('manifest','')} "
+                              f"| {str(v.get('advisory_summary','')).replace('|', '/')} |")
+          if rows:
+              print(f"- Dependency có lỗ hổng trong PR: **{len(rows)}**\n")
+              print("| Severity | Advisory | Package | Manifest | Mô tả |\n|---|---|---|---|---|")
+              print("\n".join(rows[:40]))
+          elif outcome == "success":
+              print("- Không có dependency mới nào có lỗ hổng đã biết.")
+          else:
+              print("- Xem chi tiết trong log của job Dependency Review.")
+          EOF
+          cat report/10-dependency-review.md
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-dependency-review
+          path: report/
+          retention-days: 7
+
+  # ------------------------------------------------------------------------------------------------
+  repo-cve:
+    name: "CVE: Trivy manifest repo"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+
+      - name: Checkout base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - name: Trivy fs (PR và base)
+        id: scan
+        run: |
+          mkdir -p out "$RUNNER_TEMP/trivy-cache"
+          trivy() {
+            docker run --rm -u "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/cache \
+              -v "$RUNNER_TEMP/trivy-cache:/cache" -v "$GITHUB_WORKSPACE:/w" "$TRIVY_IMAGE" "$@"
+          }
+          # --offline-scan: không gọi Maven Central để resolve pom.xml (dễ bị 429 rate limit). Dependency
+          # Java (kể cả transitive) được quét chính xác từ fat jar trong job image storage-service.
+          opts=(--quiet --offline-scan --timeout 15m)
+          trivy fs "${opts[@]}" --scanners vuln --format json --output /w/out/repo-head.json /w/head
+          trivy fs "${opts[@]}" --scanners vuln --skip-db-update --format json --output /w/out/repo-base.json /w/base
+          trivy fs "${opts[@]}" --skip-db-update --format cyclonedx --output /w/out/repo-sbom.cdx.json /w/head
+
+      - name: So sánh với base
+        id: diff
+        if: steps.scan.outcome == 'success'
+        run: |
+          set +e
+          python3 head/.github/ci/vuln_diff.py --name repo --head out/repo-head.json --base out/repo-base.json \
+            --severities "$GATE_SEVERITIES" --report out/repo-diff.md
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Báo cáo
+        if: always()
+        env:
+          SCAN: ${{ steps.scan.outcome }}
+          DIFF_RC: ${{ steps.diff.outputs.rc }}
+        run: |
+          mkdir -p report
+          {
+            echo "### 📦 Trivy: manifest trong repo (requirements.txt, package-lock.json, go.mod, pom.xml)"
+            if [ "$SCAN" != "success" ]; then
+              echo "- ❌ Quét thất bại, xem log bước \"Trivy fs\"."
+            else
+              [ "$DIFF_RC" = "0" ] && echo "- ✅ Không có CVE ${GATE_SEVERITIES} mới" || echo "- ❌ Có CVE ${GATE_SEVERITIES} mới"
+              cat out/repo-diff.md
+            fi
+          } > report/20-repo.md
+          cat report/20-repo.md >> "$GITHUB_STEP_SUMMARY"
+          [ "$SCAN" = "success" ] && [ "$DIFF_RC" = "0" ]
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-repo
+          path: report/
+          retention-days: 7
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: cve-repo
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ------------------------------------------------------------------------------------------------
+  authn-source:
+    name: "Build: authn-service (requirements.txt)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Image triển khai cài requirements.runtime.txt, nên PR chỉ sửa authn-service/requirements.txt
+      # không được build qua image. Bước này cài đúng các gói app dùng với phiên bản trong requirements.txt,
+      # trên cùng base image Python với Dockerfile triển khai, rồi chạy pip check và import app.
+      - name: Cài dependency và import app
+        id: check
+        run: |
+          py_image=$(awk 'toupper($1)=="FROM" {print $2; exit}' deploy/azure/authn-service/Dockerfile)
+          echo "Base image: $py_image"
+          python3 .github/ci/authn_source_requirements.py authn-service/requirements.txt \
+            deploy/azure/authn-service/requirements.runtime.txt "$RUNNER_TEMP/authn-req.txt"
+          docker run --rm -v "$PWD/authn-service:/app:ro" -v "$RUNNER_TEMP/authn-req.txt:/tmp/req.txt:ro" \
+            -w /app "$py_image" sh -ec '
+              pip install --quiet --no-cache-dir --disable-pip-version-check -r /tmp/req.txt
+              pip check
+              python -c "import importlib.util as u; s = u.spec_from_file_location(\"app\", \"authn-service.py\"); m = u.module_from_spec(s); s.loader.exec_module(m); print(\"import app OK\")"
+            ' 2>&1 | tee "$RUNNER_TEMP/authn.log"
+
+      - name: Báo cáo
+        if: always()
+        env:
+          OUTCOME: ${{ steps.check.outcome }}
+        run: |
+          mkdir -p report
+          {
+            echo "### 🐍 authn-service theo authn-service/requirements.txt"
+            if [ "$OUTCOME" = "success" ]; then
+              echo "- ✅ Cài được, \`pip check\` OK, import app OK"
+            else
+              echo "- ❌ **Thất bại**: dependency không cài được, xung đột phiên bản hoặc app không import được"
+              echo; echo '```'; tail -n 25 "$RUNNER_TEMP/authn.log" 2>/dev/null; echo '```'
+            fi
+          } > report/25-authn-source.md
+          cat report/25-authn-source.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-authn-source
+          path: report/
+          retention-days: 7
+
+  # ------------------------------------------------------------------------------------------------
+  images:
+    name: "Build + CVE: ${{ matrix.service }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [authn-service, gallery-service, frontend, storage-service]
+    env:
+      DOCKERFILE: deploy/azure/${{ matrix.service }}/Dockerfile
+      DOCKER_BUILD_SUMMARY: "false"
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+
+      - name: Checkout base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image (PR)
+        id: build
+        continue-on-error: true
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: head
+          file: head/${{ env.DOCKERFILE }}
+          tags: ci/${{ matrix.service }}:pr
+          outputs: type=docker,dest=${{ runner.temp }}/head.tar
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          provenance: false
+
+      - name: Build image (base)
+        id: build-base
+        if: hashFiles(format('base/deploy/azure/{0}/Dockerfile', matrix.service)) != ''
+        continue-on-error: true
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: base
+          file: base/${{ env.DOCKERFILE }}
+          tags: ci/${{ matrix.service }}:base
+          outputs: type=docker,dest=${{ runner.temp }}/base.tar
+          cache-from: type=gha,scope=${{ matrix.service }}
+          provenance: false
+
+      - name: Trivy scan image
+        id: scan
+        if: steps.build.outcome == 'success'
+        run: |
+          mkdir -p out "$RUNNER_TEMP/trivy-cache"
+          trivy() {
+            docker run --rm -u "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/cache \
+              -v "$RUNNER_TEMP/trivy-cache:/cache" -v "$RUNNER_TEMP:/images:ro" -v "$GITHUB_WORKSPACE/out:/out" \
+              "$TRIVY_IMAGE" "$@"
+          }
+          trivy image --quiet --scanners vuln --timeout 15m --input /images/head.tar --format json --output /out/image-head.json
+          trivy image --quiet --timeout 15m --skip-db-update --input /images/head.tar --format cyclonedx --output /out/sbom.cdx.json
+          if [ -f "$RUNNER_TEMP/base.tar" ]; then
+            trivy image --quiet --scanners vuln --timeout 15m --skip-db-update --input /images/base.tar --format json --output /out/image-base.json
+          fi
+
+      - name: So sánh với base
+        id: diff
+        if: steps.scan.outcome == 'success'
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          set +e
+          base_arg=()
+          [ -f out/image-base.json ] && base_arg=(--base out/image-base.json)
+          python3 head/.github/ci/vuln_diff.py --name "$SERVICE" --head out/image-head.json "${base_arg[@]}" \
+            --severities "$GATE_SEVERITIES" --report out/diff.md
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Báo cáo
+        if: always()
+        env:
+          SERVICE: ${{ matrix.service }}
+          BUILD: ${{ steps.build.outcome }}
+          BUILD_BASE: ${{ steps.build-base.outcome }}
+          SCAN: ${{ steps.scan.outcome }}
+          DIFF_RC: ${{ steps.diff.outputs.rc }}
+        run: |
+          mkdir -p report
+          ok=true
+          {
+            echo "### 🐳 Image \`${SERVICE}\`"
+            if [ "$BUILD" = "success" ]; then
+              echo "- ✅ Build thành công ($(du -h "$RUNNER_TEMP/head.tar" | cut -f1))"
+            else
+              echo "- ❌ **Build thất bại**, xem log bước \"Build image (PR)\""
+              ok=false
+            fi
+            case "$BUILD_BASE" in
+              success) ;;
+              skipped) echo "- ℹ️ Nhánh base chưa có Dockerfile này" ;;
+              *)       echo "- ⚠️ Image base build lỗi, không có mốc so sánh CVE" ;;
+            esac
+            if [ "$BUILD" = "success" ]; then
+              if [ "$SCAN" != "success" ]; then
+                echo "- ❌ Quét CVE thất bại, xem log bước \"Trivy scan image\""; ok=false
+              elif [ "$DIFF_RC" = "0" ]; then
+                echo "- ✅ Không có CVE ${GATE_SEVERITIES} mới"
+              else
+                echo "- ❌ Có CVE ${GATE_SEVERITIES} mới"; ok=false
+              fi
+              [ -f out/diff.md ] && cat out/diff.md
+            fi
+          } > "report/30-image-${SERVICE}.md"
+          cat "report/30-image-${SERVICE}.md" >> "$GITHUB_STEP_SUMMARY"
+          $ok
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-image-${{ matrix.service }}
+          path: report/
+          retention-days: 7
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: cve-image-${{ matrix.service }}
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ------------------------------------------------------------------------------------------------
+  pr-gate:
+    name: PR Gate
+    if: always()
+    needs: [dependency-review, repo-cve, authn-source, images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          pattern: report-*
+          merge-multiple: true
+          path: report
+
+      - name: Tổng hợp kết quả
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'EOF'
+          import glob, json, os, sys
+          needs = json.loads(os.environ["NEEDS"])
+          labels = {
+              "dependency-review": "CVE: Dependency Review (dependency trong PR)",
+              "repo-cve": "CVE: Trivy manifest repo (so với base)",
+              "authn-source": "Build: authn-service theo requirements.txt",
+              "images": "Build + CVE: 4 image triển khai (so với base)",
+          }
+          icon = {"success": "✅", "failure": "❌", "cancelled": "⏹️", "skipped": "⏭️"}
+          failed = [k for k, v in needs.items() if v["result"] != "success"]
+          out = [f"## 🛡️ DevSecOps PR #{os.environ['PR_NUMBER']} (`{os.environ['HEAD_SHA'][:7]}`)", ""]
+          out.append("**❌ Chưa đạt, chưa nên merge**" if failed else "**✅ Đạt mọi kiểm tra: CVE và build**")
+          out += ["", "| Kiểm tra | Kết quả |", "|---|---|"]
+          for key, label in labels.items():
+              result = needs.get(key, {}).get("result", "skipped")
+              out.append(f"| {label} | {icon.get(result, '⚠️')} {result} |")
+          out.append("")
+          for path in sorted(glob.glob("report/*.md")):
+              with open(path, encoding="utf-8") as f:
+                  out += [f.read().rstrip(), ""]
+          out.append("_Gate CVE chặn lỗ hổng " + os.environ.get("GATE_SEVERITIES", "") +
+                     " mới so với nhánh base. Kết quả JSON và SBOM (CycloneDX) nằm trong artifact `cve-*` của lần chạy này._")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\n".join(out) + "\n")
+          print("\n".join(out))
+          sys.exit(1 if failed else 0)
+          EOF
