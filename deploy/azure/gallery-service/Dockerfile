@@ -1,6 +1,6 @@
 # Build context: thư mục gốc repo
 #   docker build -f deploy/azure/gallery-service/Dockerfile -t gallery-service .
-FROM golang:1.22-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 COPY gallery-service/go.mod gallery-service/go.sum ./
 RUN go mod download
