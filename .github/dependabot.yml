@@ -20,7 +20,7 @@ updates:
       - "/deploy/azure/gallery-service"
       - "/deploy/azure/storage-service"
     schedule:
-      interval: "weekly"
+      interval: "daily"
     assignees:
       - "adminquochungonline"
     commit-message:
